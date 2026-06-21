@@ -3,7 +3,7 @@ from datetime import timedelta
 
 from django.contrib.auth import authenticate
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import F
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
@@ -50,8 +50,16 @@ def _increment_stat(performance, intercept_type):
     LimitInterceptStat.objects.filter(pk=stat.pk).update(count=F("count") + 1)
 
 
+def _record_consecutive_fail(user, performance, detail):
+    if not user or not user.is_authenticated:
+        return
+    RiskLog.objects.create(
+        user=user, performance=performance, risk_type="consecutive_fail",
+        description=detail,
+    )
+
+
 def _check_consecutive_fail(user, performance):
-    """短时间连续下单失败检测。返回 (是否触发, 描述)。"""
     if not user or not user.is_authenticated:
         return False, ""
     window_start = timezone.now() - timedelta(minutes=CONSECUTIVE_FAIL_WINDOW_MINUTES)
@@ -61,13 +69,15 @@ def _check_consecutive_fail(user, performance):
         risk_type="consecutive_fail",
         created_at__gte=window_start,
     ).count()
-    if recent_failures >= CONSECUTIVE_FAIL_THRESHOLD - 1:
-        return True, f"{CONSECUTIVE_FAIL_WINDOW_MINUTES}分钟内连续下单失败{recent_failures + 1}次"
+    if recent_failures >= CONSECUTIVE_FAIL_THRESHOLD:
+        return True, (
+            f"{CONSECUTIVE_FAIL_WINDOW_MINUTES}分钟内连续下单失败"
+            f"{recent_failures}次，已达阈值{CONSECUTIVE_FAIL_THRESHOLD}"
+        )
     return False, ""
 
 
 def _check_too_many_ids(user):
-    """账号绑定证件数超阈值检测。返回 (是否触发, 描述)。"""
     if not user or not user.is_authenticated:
         return False, ""
     id_count = Audience.objects.filter(user=user).values("id_type", "id_number").distinct().count()
@@ -121,7 +131,6 @@ class PerformanceViewSet(viewsets.ModelViewSet):
 
 
 class AudienceViewSet(viewsets.ModelViewSet):
-    """实名观演人管理。归属当前登录账号。"""
     serializer_class = AudienceSerializer
 
     def get_queryset(self):
@@ -132,7 +141,6 @@ class AudienceViewSet(viewsets.ModelViewSet):
 
 
 class PurchaseLimitRuleViewSet(viewsets.ModelViewSet):
-    """场次限购规则配置。"""
     queryset = PurchaseLimitRule.objects.select_related("performance").all()
     serializer_class = PurchaseLimitRuleSerializer
     http_method_names = ["get", "post", "put", "patch"]
@@ -147,13 +155,11 @@ class PurchaseLimitRuleViewSet(viewsets.ModelViewSet):
 
 
 class IDBlacklistViewSet(viewsets.ModelViewSet):
-    """证件黑名单管理。"""
     queryset = IDBlacklist.objects.all().order_by("-created_at")
     serializer_class = IDBlacklistSerializer
 
 
 class RiskLogViewSet(viewsets.ReadOnlyModelViewSet):
-    """风险日志（只读）。"""
     queryset = RiskLog.objects.select_related("user", "performance", "performance__show").all()
     serializer_class = RiskLogSerializer
 
@@ -192,24 +198,30 @@ class OrderViewSet(viewsets.ModelViewSet):
         except Performance.DoesNotExist:
             return Response({"detail": "场次不存在"}, status=status.HTTP_404_NOT_FOUND)
 
+        triggered, desc = _check_consecutive_fail(user, perf)
+        if triggered:
+            _record_consecutive_fail(user, perf, desc)
+            return Response({"detail": desc}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
         quantity = len(data["audience_ids"])
         remaining = perf.total_seats - perf.sold_seats
         if quantity > remaining:
-            return Response({"detail": "余票不足"}, status=status.HTTP_409_CONFLICT)
+            detail = "余票不足"
+            _record_consecutive_fail(user, perf, detail)
+            return Response({"detail": detail}, status=status.HTTP_409_CONFLICT)
 
-        audiences = Audience.objects.filter(
-            id__in=data["audience_ids"]
-        ).select_for_update()
+        audiences = Audience.objects.filter(id__in=data["audience_ids"])
         if audiences.count() != quantity:
-            return Response({"detail": "存在无效的观演人"}, status=status.HTTP_400_BAD_REQUEST)
+            detail = "存在无效的观演人"
+            _record_consecutive_fail(user, perf, detail)
+            return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
 
         if user:
             for aud in audiences:
                 if aud.user_id != user.id:
-                    return Response(
-                        {"detail": f"观演人「{aud.name}」不属于当前账号"},
-                        status=status.HTTP_400_BAD_REQUEST,
-                    )
+                    detail = f"观演人「{aud.name}」不属于当前账号"
+                    _record_consecutive_fail(user, perf, detail)
+                    return Response({"detail": detail}, status=status.HTTP_400_BAD_REQUEST)
 
         rule = getattr(perf, "limit_rule", None)
         max_per_id = rule.max_per_id if rule else DEFAULT_MAX_PER_ID
@@ -221,16 +233,15 @@ class OrderViewSet(viewsets.ModelViewSet):
 
         for (id_type, id_number), cnt in id_counts_request.items():
             if cnt > max_per_id:
+                detail = f"证件号 {id_number} 在本单中超过限购上限 {max_per_id} 张"
                 RiskLog.objects.create(
                     user=user, performance=perf, risk_type="limit_id",
                     id_number=id_number,
                     description=f"同证件在本单中购票{cnt}张，超过上限{max_per_id}",
                 )
                 _increment_stat(perf, "id")
-                return Response(
-                    {"detail": f"证件号 {id_number} 在本单中超过限购上限 {max_per_id} 张"},
-                    status=status.HTTP_409_CONFLICT,
-                )
+                _record_consecutive_fail(user, perf, detail)
+                return Response({"detail": detail}, status=status.HTTP_409_CONFLICT)
 
         paid_orders = TicketOrder.objects.filter(
             performance=perf, status="paid"
@@ -244,16 +255,15 @@ class OrderViewSet(viewsets.ModelViewSet):
                 audience__id_number=id_number,
             ).count()
             if existing + cnt_request > max_per_id:
+                detail = f"证件号 {id_number} 在本场次累计超过限购上限 {max_per_id} 张"
                 RiskLog.objects.create(
                     user=user, performance=perf, risk_type="limit_id",
                     id_number=id_number,
                     description=f"证件已购{existing}张+本单{cnt_request}张，超过上限{max_per_id}",
                 )
                 _increment_stat(perf, "id")
-                return Response(
-                    {"detail": f"证件号 {id_number} 在本场次累计超过限购上限 {max_per_id} 张"},
-                    status=status.HTTP_409_CONFLICT,
-                )
+                _record_consecutive_fail(user, perf, detail)
+                return Response({"detail": detail}, status=status.HTTP_409_CONFLICT)
 
         if user:
             account_existing = Ticket.objects.filter(
@@ -262,31 +272,29 @@ class OrderViewSet(viewsets.ModelViewSet):
                 order__user=user,
             ).count()
             if account_existing + quantity > max_per_account:
+                detail = f"当前账号在本场次累计超过限购上限 {max_per_account} 张"
                 RiskLog.objects.create(
                     user=user, performance=perf, risk_type="limit_account",
                     description=f"账号已购{account_existing}张+本单{quantity}张，超过上限{max_per_account}",
                 )
                 _increment_stat(perf, "account")
-                return Response(
-                    {"detail": f"当前账号在本场次累计超过限购上限 {max_per_account} 张"},
-                    status=status.HTTP_409_CONFLICT,
-                )
+                _record_consecutive_fail(user, perf, detail)
+                return Response({"detail": detail}, status=status.HTTP_409_CONFLICT)
 
         blacklist_ids = set(
             IDBlacklist.objects.values_list("id_type", "id_number")
         )
         for aud in audiences:
             if (aud.id_type, aud.id_number) in blacklist_ids:
+                detail = f"证件号 {aud.id_number} 已被列入黑名单，无法购票"
                 RiskLog.objects.create(
                     user=user, performance=perf, risk_type="id_blacklist",
                     id_number=aud.id_number,
                     description=f"黑名单证件号 {aud.id_number} 尝试下单",
                 )
                 _increment_stat(perf, "blacklist")
-                return Response(
-                    {"detail": f"证件号 {aud.id_number} 已被列入黑名单，无法购票"},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
+                _record_consecutive_fail(user, perf, detail)
+                return Response({"detail": detail}, status=status.HTTP_403_FORBIDDEN)
 
         triggered, desc = _check_too_many_ids(user)
         if triggered:
@@ -315,6 +323,19 @@ class OrderViewSet(viewsets.ModelViewSet):
         if warnings:
             resp_data["risk_warnings"] = warnings
         return Response(resp_data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        order = self.get_object()
+        if order.status == "cancelled":
+            return Response({"detail": "订单已取消"}, status=status.HTTP_400_BAD_REQUEST)
+        perf = order.performance
+        perf.sold_seats = max(0, perf.sold_seats - order.quantity)
+        perf.save(update_fields=["sold_seats"])
+        order.status = "cancelled"
+        order.save(update_fields=["status"])
+        return Response(OrderSerializer(order).data)
 
 
 @api_view(["GET"])

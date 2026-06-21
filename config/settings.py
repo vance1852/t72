@@ -1,5 +1,6 @@
 """Django 配置 —— 演出票务与场次座位管理平台。"""
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,17 +24,27 @@ MIDDLEWARE = [
 ROOT_URLCONF = "config.urls"
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.mysql",
-        "NAME": os.getenv("DB_NAME", "show_ticketing"),
-        "USER": os.getenv("DB_USER", "show"),
-        "PASSWORD": os.getenv("DB_PASSWORD", "show123"),
-        "HOST": os.getenv("DB_HOST", "127.0.0.1"),
-        "PORT": os.getenv("DB_PORT", "3306"),
-        "OPTIONS": {"charset": "utf8mb4"},
+TESTING = "test" in sys.argv
+
+if TESTING:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "test_db.sqlite3",
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.getenv("DB_NAME", "show_ticketing"),
+            "USER": os.getenv("DB_USER", "show"),
+            "PASSWORD": os.getenv("DB_PASSWORD", "show123"),
+            "HOST": os.getenv("DB_HOST", "127.0.0.1"),
+            "PORT": os.getenv("DB_PORT", "3306"),
+            "OPTIONS": {"charset": "utf8mb4"},
+        }
+    }
 
 AUTH_PASSWORD_VALIDATORS = []
 
